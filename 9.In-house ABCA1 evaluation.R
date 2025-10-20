@@ -112,6 +112,7 @@ colnames(data_filtered) <- clean_names(colnames(data_filtered))
 # Run MICE (predictive mean matching), m=5
 imp <- mice(data_filtered, method = "pmm", m = 5, maxit = 50, seed = 123)
 saveRDS(imp,file='data_miced.rds')
+imp <- readRDS('data_miced.rds')
 data_miced <- imp
 
 # Overview of imputation
@@ -252,6 +253,55 @@ print(plots_list[[1]])  # e.g., 'Group' plot (index-based)
 ggsave(plots_list[[1]], file='Weight_Spearman.pdf',height=4,width=5)
 ggsave(plots_list[[2]], file='BMI_Spearman.pdf',height=4,width=5)
 ggsave(plots_list[[3]], file='LDL_Spearman.pdf',height=4,width=5)
+
+
+# Note: In this cohort, LDL_mmol_L and BMI have complete data (0% missing).
+d1 <- complete(data_miced, 1)
+d1_male   <- droplevels(subset(d1,   Sex == "Male"))
+d1_female <- droplevels(subset(d1,   Sex == "Female"))
+# ---- safety checks (optional) ----
+stopifnot(all(c("ABCA1_ng_ml","LDL_mmol_L","BMI") %in% names(d1_male)))
+stopifnot(all(c("ABCA1_ng_ml","LDL_mmol_L","BMI") %in% names(d1_female)))
+
+# ---- helper: compute Spearman (rho & p) on a given subset ----
+get_spearman <- function(df, xvar, yvar = "ABCA1_ng_ml") {
+  ok <- stats::complete.cases(df[, c(xvar, yvar)])
+  n  <- sum(ok)
+  if (n < 3) return(list(rho = NA_real_, p = NA_real_, n = n))
+  ct <- suppressWarnings(cor.test(df[[xvar]][ok], df[[yvar]][ok],
+                                  method = "spearman", exact = FALSE))
+  list(rho = unname(ct$estimate), p = ct$p.value, n = n)
+}
+
+# ---- loop over variables and sex subsets; build plots & save PDFs ----
+plots_list    <- list()
+filtered_vars <- c("LDL_mmol_L","BMI")
+
+for (sex in c("male","female")) {
+  df_sex <- if (sex == "male") d1_male else d1_female
+  
+  for (i in seq_along(filtered_vars)) {
+    # 1) variable name
+    var_name <- filtered_vars[i]
+    
+    # 2) compute Spearman on this subset
+    sp <- get_spearman(df_sex, var_name)  # list(rho=..., p=..., n=...)
+    
+    # 3) build plot with the computed rho/p
+    p <- plot_one_var(var_name, df_sex, sp$rho, sp$p)
+    
+    # 4) store & save
+    key <- paste0(var_name, "_", sex)
+    plots_list[[key]] <- p
+    
+    ggsave(plot = p,
+           filename = paste0(var_name, "_", sex, "_Spearman.pdf"),
+           height = 4, width = 5, device = "pdf")
+  }
+}
+
+# Example: show one plot in the viewer
+print(plots_list[["LDL_mmol_L_male"]])
 
 
 ############################################
@@ -880,3 +930,631 @@ ggplot(coef_df, aes(x = estimate, y = term)) +
     legend.position = "none"
   ) +
   xlim(min(df$lower) - 0.01, max(df$upper) + 0.01)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+############################################################
+# Baseline tables (ALS vs CON) — automatic test selection
+# - Keep variables only if non-missing n ≥ 24 (missing <20%)
+# - Auto-choose tests per variable:
+#     * Categorical: Fisher's exact if any cell/expected < 5, else Chi-square
+#     * Continuous: Welch t-test if both groups ~normal (Shapiro p≥0.05),
+#                   else Wilcoxon rank-sum
+# - Exports: Excel (.xlsx) and PDF (.pdf)
+# NOTE: PDF export requires a LaTeX installation (e.g., TinyTeX).
+############################################################
+
+# ---- 0) Packages ----
+# install.packages(c("readxl","dplyr","compareGroups"))
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(compareGroups)
+})
+
+# ---- 1) Load data ----
+file_path <- "Serum_ABCA1_and_ClinicalData_ALS_vs_Control.xlsx"
+dat <- read_excel(file_path)
+
+# ---- 2) Preprocessing (factor coding & 0/1 to No/Yes) ----
+to_no_yes_factor <- function(x) {
+  if (is.factor(x)) return(x)
+  if (is.numeric(x) || is.integer(x)) {
+    ux <- unique(na.omit(x))
+    if (all(ux %in% c(0, 1))) return(factor(x, levels = c(0,1), labels = c("No","Yes")))
+  }
+  if (is.character(x)) {
+    xl <- tolower(trimws(x))
+    if (all(na.omit(xl) %in% c("0","1","no","yes","none","absent","present"))) {
+      y <- ifelse(xl %in% c("1","yes","present"), "Yes",
+                  ifelse(xl %in% c("0","no","none","absent"), "No", NA))
+      return(factor(y, levels = c("No","Yes")))
+    }
+  }
+  x
+}
+
+# Group as factor (must be "CON" and "ALS")
+if (!"Group" %in% names(dat)) stop("Column `Group` not found (needs 'CON'/'ALS').")
+dat <- dat |> mutate(Group = factor(Group, levels = c("CON","ALS")))
+
+# Sex to factor if present (robust recoding)
+if ("Sex" %in% names(dat)) {
+  dat <- dat |>
+    mutate(
+      Sex = case_when(
+        tolower(as.character(Sex)) %in% c("female","f","0") ~ "Female",
+        tolower(as.character(Sex)) %in% c("male","m","1")   ~ "Male",
+        TRUE ~ as.character(Sex)
+      ),
+      Sex = factor(Sex, levels = c("Female","Male"))
+    )
+}
+
+# Convert 0/1 comorbidity/medication variables to No/Yes factors (if present)
+bin_cols <- c("Hypertension","Diabetes","Riluzole Use","LipidDrug Use",
+              "Antihypertensive Use","Antidiabetic Use")
+for (v in intersect(bin_cols, names(dat))) dat[[v]] <- to_no_yes_factor(dat[[v]])
+
+# ---- 3) Final variable lists (as agreed) ----
+# Main (≤15): TC in main; Glucose moved to supplement
+main_vars_final <- c(
+  "Age","Sex","BMI","Height(cm)","Weight(kg)",
+  "Hypertension","Diabetes","Antihypertensive Use","Antidiabetic Use",
+  "HbA1c","ALT(U/L)",
+  "LDL(mmol/L)","HDL(mmol/L)","TC(mmol/L)","TG(mmol/L)",
+  "WBC(e9/L)"
+)
+
+supp_vars_final <- c(
+  "Riluzole Use","LipidDrug Use",
+  "Glucose(mmol/L)","Creatinine(umol/L)","Hcy(umol/L)",
+  "Na(mmol/L)","K(mmol/L)","Cl(mmol/L)","Ca(mmol/L)","P(mmol/L)",
+  "AST(U/L)","ALP(U/L)","DBIL(umol/L)","IBIL(umol/L)","ALB(g/L)","GLB(g/L)",
+  "HB(g/L)","PLT(e9/L)","RBC(e12/L)",
+  "NEUT(e9/L)","LYM(e9/L)","MONO(e9/L)","EOS(e9/L)","BASO(e9/L)"
+)
+
+# ---- 4) Missingness rule: keep only variables with n ≥ 24 ----
+total_n <- nrow(dat)
+nn <- sapply(dat, function(x) sum(!is.na(x)))
+keep_main <- intersect(main_vars_final, names(dat))
+keep_supp <- intersect(supp_vars_final, names(dat))
+keep_main <- keep_main[nn[keep_main] >= 24]
+keep_supp <- keep_supp[nn[keep_supp] >= 24]
+
+dropped_main <- setdiff(main_vars_final, keep_main)
+dropped_supp <- setdiff(supp_vars_final, keep_supp)
+if (length(dropped_main)) message("Dropped from MAIN (n<24): ", paste(dropped_main, collapse=", "))
+if (length(dropped_supp)) message("Dropped from SUPP (n<24): ", paste(dropped_supp, collapse=", "))
+
+# ---- 5) Auto-select methods per variable (compareGroups::method vector) ----
+# method = 1 -> nonparametric (Wilcoxon for continuous; Fisher for categorical)
+# method = 2 -> parametric (Welch t for continuous; Chi-square for categorical)
+is_categorical <- function(x) is.factor(x) || is.character(x)
+
+choose_method_for_var <- function(varname, data) {
+  x <- data[[varname]]
+  g <- data$Group
+  ok <- !is.na(x) & !is.na(g)
+  x <- x[ok]; g <- g[ok]
+  if (length(x) == 0) return(NA_integer_)  # let compareGroups decide (shouldn't happen after filtering)
+  
+  # CATEGORICAL: Fisher if any cell or expected < 5; else Chi-square
+  if (is_categorical(x)) {
+    f <- if (!is.factor(x)) factor(x) else x
+    # If too many levels (sparse multi-level), prefer Fisher
+    if (nlevels(f) > 6) return(1L)
+    tab <- table(g, f)
+    if (any(tab < 5)) return(1L)
+    # try expected counts; if error, fallback to Fisher
+    exp_ok <- tryCatch({
+      suppressWarnings({
+        ce <- suppressWarnings(chisq.test(tab, correct = FALSE))
+        all(ce$expected >= 5)
+      })
+    }, error = function(e) FALSE)
+    if (!exp_ok) return(1L) else return(2L)
+  }
+  
+  # CONTINUOUS: Welch t if both groups ~normal; else Wilcoxon
+  # Need enough per-group size for Shapiro (n>=3)
+  x0 <- x[g == "CON"]; x1 <- x[g == "ALS"]
+  normal0 <- if (length(x0) >= 3) shapiro.test(x0)$p.value >= 0.05 else FALSE
+  normal1 <- if (length(x1) >= 3) shapiro.test(x1)$p.value >= 0.05 else FALSE
+  if (normal0 && normal1) return(2L) else return(1L)
+}
+
+# Build method vectors
+method_vec_main <- rep(NA_integer_, length(keep_main))
+names(method_vec_main) <- keep_main
+for (v in keep_main) method_vec_main[v] <- choose_method_for_var(v, dat)
+
+method_vec_supp <- NULL
+if (length(keep_supp)) {
+  method_vec_supp <- rep(NA_integer_, length(keep_supp))
+  names(method_vec_supp) <- keep_supp
+  for (v in keep_supp) method_vec_supp[v] <- choose_method_for_var(v, dat)
+}
+
+# Optional: print a compact summary of selected methods
+print_selected_methods <- function(method_vec, title) {
+  if (is.null(method_vec)) return()
+  cat("\n----", title, "----\n", sep = "")
+  for (nm in names(method_vec)) {
+    m <- method_vec[[nm]]
+    cat(sprintf("%-25s : %s\n", nm,
+                ifelse(is.na(m), "auto (NA)",
+                       ifelse(m == 1, "nonparametric (Wilcoxon/Fisher)", "parametric (Welch t/Chi-square)"))))
+  }
+}
+print_selected_methods(method_vec_main, "MAIN methods")
+print_selected_methods(method_vec_supp, "SUPP methods")
+
+# ---- 6) Fit compareGroups and create tables ----
+res_main <- compareGroups(
+  Group ~ .,
+  data   = dat[, c("Group", keep_main), drop = FALSE],
+  method = method_vec_main
+)
+tab_main <- createTable(res_main, show.p.overall = TRUE, show.n = TRUE, digits = 2)
+
+tab_supp <- NULL
+if (length(keep_supp)) {
+  res_supp <- compareGroups(
+    Group ~ .,
+    data   = dat[, c("Group", keep_supp), drop = FALSE],
+    method = method_vec_supp
+  )
+  tab_supp <- createTable(res_supp, show.p.overall = TRUE, show.n = TRUE, digits = 2)
+}
+
+# ---- 7) Export: Excel & PDF ----
+export2xls(tab_main, file = "Table1_Baseline_main.xlsx")
+if (!is.null(tab_supp)) export2xls(tab_supp, file = "TableS_Baseline_supp.xlsx")
+
+safe_export2pdf <- function(tbl, path) {
+  tryCatch(
+    { export2pdf(tbl, file = path); message("PDF exported: ", path) },
+    error = function(e) {
+      message("PDF export failed: ", e$message,
+              "\nTip: use export2html() + webshot2/pagedown to convert to PDF.")
+    }
+  )
+}
+safe_export2pdf(tab_main, "Table1_Baseline_main.pdf")
+if (!is.null(tab_supp)) safe_export2pdf(tab_supp, "TableS_Baseline_supp.pdf")
+
+message("\n✅ Done:")
+message(" - Main:  Table1_Baseline_main.xlsx / Table1_Baseline_supp.pdf")
+if (is.null(tab_supp)) {
+  message(" - Supplementary: not created (no variables with n ≥ 24).")
+} else {
+  message(" - Supp:  TableS_Baseline_supp.xlsx / TableS_Baseline_supp.pdf")
+}
+
+############################################################
+# METHODS (for manuscript; English)
+# We summarized baseline characteristics of ALS vs control cohorts.
+# Variables were included only if missingness <20% (i.e., available n ≥ 24 of 30).
+# For continuous variables, we assessed normality per group using the Shapiro–Wilk test.
+# If both groups were approximately normal (p ≥ 0.05), we used a two-sample Welch t-test
+# and reported mean (SD). Otherwise, we used the Wilcoxon rank-sum test and reported
+# median [IQR]. For categorical variables, we first examined contingency tables; if any
+# observed cell count or expected cell count was < 5, we used Fisher’s exact test; otherwise,
+# we used the Chi-square test. Two-sided p-values were reported as overall group comparisons.
+# Table 1 (main) contained ≤15 key variables (Age, Sex, BMI, comorbidities/medications,
+# and core labs including HbA1c, eGFR, ALT, LDL, HDL, TC, TG, WBC). Additional variables
+# meeting the missingness threshold were presented in the supplementary table.
+############################################################
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+############################################################
+# ALSFRS-R (total & 4 domains) vs ABCA1 — Full Pipeline
+# - Read & preprocessing
+# - Spearman correlations (+ FDR) with scatter/LOESS plots
+# - Adjusted linear regression with standardized betas
+# - Median split (High vs Low) group tests:
+#     If normality & equal variances → Student's t-test + BAR (mean±SE)
+#     Else → Wilcoxon rank-sum + BOXPLOT
+# - Save ALL figures as PDF ONLY
+############################################################
+
+# ---- 0) Packages ----
+# install.packages(c("readxl","dplyr","ggplot2","ggpubr","ggExtra","broom","rstatix","pROC","car","splines"))
+suppressPackageStartupMessages({
+  library(readxl);  library(dplyr);   library(ggplot2); library(ggpubr)
+  library(ggExtra); library(broom);   library(rstatix); library(pROC)
+  library(car);     library(splines)
+})
+
+# ---- 1) Load data ----
+dat <- read_excel("ALS_ABCA1_ALSFRSR_Dataset.xlsx")
+
+# ---- 2) Harmonize column names ----
+# Handle trailing spaces in names (e.g., "Riluzole Use ")
+names(dat) <- trimws(names(dat))
+
+# Map common names to snake_case for coding convenience
+rename_map <- c(
+  "ABCA1(ng/ml)" = "ABCA1_ng_ml",
+  "ALSFRS-R"     = "ALSFRS_total",
+  "FINE MOTOR"   = "FINE_MOTOR",
+  "GROSS MOTOR"  = "GROSS_MOTOR",
+  "eGFR(ml/min)" = "eGFR_mL_min",
+  "LDL(mmol/L)"  = "LDL_mmol_L",
+  "HDL(mmol/L)"  = "HDL_mmol_L",
+  "TC(mmol/L)"   = "TC_mmol_L",
+  "TG(mmol/L)"   = "TG_mmol_L",
+  "Riluzole Use" = "Riluzole_Use",
+  "LipidDrug Use"= "LipidDrug_Use",
+  "Antihypertensive Use" = "Antihypertensive_Use",
+  "Antidiabetic Use"     = "Antidiabetic_Use",
+  "Height(cm)"   = "Height_cm",
+  "Weight(kg)"   = "Weight_kg"
+)
+for (old in intersect(names(rename_map), names(dat))) {
+  names(dat)[names(dat) == old] <- rename_map[[old]]
+}
+
+# ---- 3) Basic preprocessing & types ----
+# Factorize Sex; medication uses to No/Yes if present
+dat <- dat %>%
+  mutate(
+    Sex = if ("Sex" %in% names(.))
+      factor(trimws(as.character(Sex)), levels = c("Female","Male")) else NULL,
+    Riluzole_Use  = if ("Riluzole_Use"  %in% names(.))
+      factor(Riluzole_Use,  levels = c(0,1), labels = c("No","Yes")) else NULL,
+    LipidDrug_Use = if ("LipidDrug_Use" %in% names(.))
+      factor(LipidDrug_Use, levels = c(0,1), labels = c("No","Yes")) else NULL
+  )
+
+# Ensure numeric for ALSFRS-R scores and ABCA1
+score_vars    <- c("ALSFRS_total","BULBAR","FINE_MOTOR","GROSS_MOTOR","RESPIRATORY")
+scores_to_use <- intersect(score_vars, names(dat))
+if (!"ABCA1_ng_ml" %in% names(dat)) stop("ABCA1 column not found.")
+dat[scores_to_use] <- lapply(dat[scores_to_use], function(x) suppressWarnings(as.numeric(x)))
+dat$ABCA1_ng_ml    <- suppressWarnings(as.numeric(dat$ABCA1_ng_ml))
+
+message("N = ", nrow(dat))
+message("Scores available: ", paste(scores_to_use, collapse = ", "))
+
+# ---- helper: drop covariates with only one level/value ----
+drop_one_level_covars <- function(df, covars){
+  keep <- c(); dropped <- c()
+  for (v in covars) {
+    if (!v %in% names(df)) next
+    x <- df[[v]]; x <- x[!is.na(x)]
+    ok <- if (is.factor(x)) nlevels(droplevels(x)) >= 2 else length(unique(x)) >= 2
+    if (ok) keep <- c(keep, v) else dropped <- c(dropped, v)
+  }
+  list(keep = keep, dropped = dropped)
+}
+
+# ---------------------------------------------------------
+# A) Spearman correlations (ABCA1 vs 5 ALSFRS scores)
+# ---------------------------------------------------------
+spearman_one <- function(df, score){
+  ok <- complete.cases(df[, c("ABCA1_ng_ml", score)])
+  if (sum(ok) < 3) return(tibble(term = score, rho = NA_real_, p = NA_real_, n = sum(ok)))
+  ct <- suppressWarnings(cor.test(df$ABCA1_ng_ml[ok], df[[score]][ok], method = "spearman", exact = FALSE))
+  tibble(term = score, rho = unname(ct$estimate), p = ct$p.value, n = sum(ok))
+}
+cor_tab <- bind_rows(lapply(scores_to_use, function(s) spearman_one(dat, s))) %>%
+  mutate(p_fdr = p.adjust(p, method = "fdr"))
+print(cor_tab)
+
+# ---- E1) Spearman-style visualization (scatter + LOESS + margins + annotation) ----
+spearman_annot_plot <- function(df, xvar, yvar = "ABCA1_ng_ml") {
+  ok <- complete.cases(df[, c(xvar, yvar)])
+  rho <- pval <- NA_real_
+  if (sum(ok) >= 3) {
+    ct <- suppressWarnings(cor.test(df[[xvar]][ok], df[[yvar]][ok], method = "spearman", exact = FALSE))
+    rho  <- unname(ct$estimate); pval <- ct$p.value
+  }
+  p <- ggplot(df, aes(.data[[xvar]], .data[[yvar]])) +
+    geom_point(color = '#EE6363', size = 1.8, alpha = 0.9) +
+    geom_smooth(method = "loess", se = TRUE,
+                color = "#009ACD", fill = "#009ACD", alpha = 0.2,
+                size = 0.75, span = 0.75) +
+    geom_rug(sides = "bl", color = '#1F77B4', alpha = 0.85) +
+    annotate("text",
+             x = min(df[[xvar]], na.rm = TRUE),
+             y = max(df[[yvar]], na.rm = TRUE),
+             hjust = 0, vjust = 1, size = 5, parse = TRUE,
+             label = paste0(
+               "italic(R)[s]*' = ", ifelse(is.na(rho), "NA", sprintf('%.3f', rho)), "'",
+               "*\"\\n\"*",
+               "italic(p)*' = ", ifelse(is.na(pval), "NA", format.pval(pval, digits = 3, eps = 1e-3)), "'"
+             )) +
+    labs(x = xvar, y = "Serum ABCA1 Protein (ng/mL)",
+         title = paste0(xvar, " vs. ABCA1")) +
+    theme(
+      panel.background = element_blank(),
+      panel.grid = element_blank(),
+      panel.border = element_rect(color = "black", fill = NA, size = 0.8),
+      axis.text = element_text(color = "black", size = 12),
+      axis.title = element_text(size = 14),
+      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+      plot.margin = margin(5, 5, 5, 5)
+    )
+  ggMarginal(p, type = "histogram",
+             xparams = list(fill = "#1F77B4", color = "white"),
+             yparams = list(fill = "#1F77B4", color = "white"),
+             size = 10)
+}
+
+# Save one PDF per score (PDF only)
+for (s in scores_to_use) {
+  p_s <- spearman_annot_plot(dat, s, "ABCA1_ng_ml")
+  ggsave(filename = paste0("ABCA1_vs_", s, "_Spearman.pdf"),
+         plot = p_s, width = 5, height = 4, device = "pdf")
+}
+
+# ---------------------------------------------------------
+# B) Adjusted linear regression (std beta for score)
+# ---------------------------------------------------------
+conf_cands <- c("Age","Sex","BMI","eGFR_mL_min","LDL_mmol_L","LipidDrug_Use","Riluzole_Use")
+conf_ok    <- drop_one_level_covars(dat, intersect(conf_cands, names(dat)))
+if (length(conf_ok$dropped)) message("Dropped covariates (one level/value): ", paste(conf_ok$dropped, collapse = ", "))
+covars     <- conf_ok$keep
+
+fit_list <- lapply(scores_to_use, function(s){
+  f <- as.formula(paste("ABCA1_ng_ml ~", paste(c(s, covars), collapse = " + ")))
+  m <- lm(f, data = dat)
+  
+  # Standardized beta for the score (z-score Y and X)
+  X  <- model.matrix(m)
+  sy <- as.numeric(scale(dat$ABCA1_ng_ml))
+  sx <- scale(X[,-1, drop = FALSE])
+  m_std <- lm(sy ~ sx)
+  
+  score_pos <- which(colnames(sx) == s)
+  beta <- conf.low <- conf.high <- pval <- NA_real_
+  if (length(score_pos) == 1) {
+    co <- summary(m_std)$coefficients
+    ci <- confint(m_std)
+    beta     <- co[score_pos + 1, "Estimate"]
+    pval     <- co[score_pos + 1, "Pr(>|t|)"]
+    conf.low <- ci[score_pos + 1, 1]
+    conf.high<- ci[score_pos + 1, 2]
+  } else {
+    if (s %in% rownames(summary(m)$coefficients)) pval <- summary(m)$coefficients[s,4]
+  }
+  
+  tibble(
+    term     = s,
+    beta_std = beta,
+    conf.low = conf.low,
+    conf.high= conf.high,
+    p_raw    = pval,
+    p_fdr    = p.adjust(pval, "fdr"),
+    adjR2    = summary(m)$adj.r.squared,
+    n_model  = length(residuals(m))
+  )
+}) %>% bind_rows()
+print(fit_list)
+
+# ---------------------------------------------------------
+# C) Median split (High vs Low) + auto test selection
+#     If (both groups normal) & (Levene p>=.05) → Student t-test (var.equal=TRUE) + BAR
+#     Else → Wilcoxon + BOXPLOT
+# ---------------------------------------------------------
+mk_group <- function(x) ifelse(x >= median(x, na.rm = TRUE), "High","Low")
+for (s in scores_to_use) dat[[paste0(s, "_grp")]] <- mk_group(dat[[s]])
+
+# Helper to generate significance label from p
+p_to_label <- function(p) {
+  if (is.na(p)) return("p = NA")
+  if (p < 0.001) "p < 0.001" else sprintf("p = %.3f", p)
+}
+
+# Group test + effect size for one grouped variable
+group_test_one <- function(gvar){
+  if (!gvar %in% names(dat)) return(NULL)
+  ok <- complete.cases(dat[, c("ABCA1_ng_ml", gvar)])
+  if (sum(ok) < 3) return(tibble(group = gvar, test = NA, stat = NA, p = NA, effect = NA, n = sum(ok)))
+  
+  df_sub <- dat[ok, c("ABCA1_ng_ml", gvar)]
+  names(df_sub) <- c("ABCA1_ng_ml","grp")
+  by_g <- split(df_sub$ABCA1_ng_ml, df_sub$grp)
+  if (length(by_g) < 2 || min(lengths(by_g)) < 2)
+    return(tibble(group = gvar, test = NA, stat = NA, p = NA, effect = NA, n = sum(ok)))
+  
+  # Normality + homoscedasticity
+  p0 <- if (length(by_g[[1]]) >= 3) shapiro.test(by_g[[1]])$p.value else 0
+  p1 <- if (length(by_g[[2]]) >= 3) shapiro.test(by_g[[2]])$p.value else 0
+  lev_p <- tryCatch(car::leveneTest(df_sub$ABCA1_ng_ml ~ df_sub$grp)$`Pr(>F)`[1], error = function(e) NA_real_)
+  
+  if (!is.na(p0) && !is.na(p1) && p0 >= .05 && p1 >= .05 && !is.na(lev_p) && lev_p >= .05) {
+    # Student's t-test (equal variances)
+    t <- t.test(ABCA1_ng_ml ~ grp, data = df_sub, var.equal = TRUE)
+    eff <- rstatix::cohens_d(df_sub, ABCA1_ng_ml ~ grp, var.equal = TRUE)
+    tibble(group = gvar, test = "Student t", stat = unname(t$statistic), p = t$p.value,
+           effect = eff$effsize[1], n = sum(ok), lev_p = lev_p)
+  } else {
+    # Wilcoxon
+    w <- wilcox.test(ABCA1_ng_ml ~ grp, data = df_sub, exact = FALSE)
+    eff <- rstatix::wilcox_effsize(df_sub, ABCA1_ng_ml ~ grp)
+    tibble(group = gvar, test = "Wilcoxon rank-sum", stat = unname(w$statistic), p = w$p.value,
+           effect = eff$effsize[1], n = sum(ok), lev_p = lev_p)
+  }
+}
+
+grp_vars    <- paste0(scores_to_use, "_grp")
+grp_results <- bind_rows(lapply(grp_vars, group_test_one)) %>%
+  mutate(p_fdr = p.adjust(p, method = "fdr"))
+print(grp_results)
+
+# ---- E2) Visualization for grouped comparisons ----
+group_colors <- c("High" = "#9AC5CD", "Low" = "#FFDAB9")
+
+plot_grouped <- function(df, score, y = "ABCA1_ng_ml") {
+  gvar <- paste0(score, "_grp")
+  if (!gvar %in% names(df)) return(NULL)
+  d <- df %>% select(all_of(c(gvar, y))) %>% rename(grp = !!gvar) %>% filter(complete.cases(.))
+  if (nrow(d) < 3 || length(unique(d$grp)) < 2) return(NULL)
+  
+  # Normality & Levene for choosing plot/test
+  by_g <- split(d[[y]], d$grp)
+  p0 <- if (length(by_g[[1]]) >= 3) shapiro.test(by_g[[1]])$p.value else 0
+  p1 <- if (length(by_g[[2]]) >= 3) shapiro.test(by_g[[2]])$p.value else 0
+  lev_p <- tryCatch(car::leveneTest(d[[y]] ~ d$grp)$`Pr(>F)`[1], error = function(e) NA_real_)
+  y_max <- max(d[[y]], na.rm = TRUE)
+  
+  if (!is.na(p0) && !is.na(p1) && p0 >= .05 && p1 >= .05 && !is.na(lev_p) && lev_p >= .05) {
+    # Student t-test p-value for annotation
+    pval <- t.test(ABCA1_ng_ml ~ grp, data = d, var.equal = TRUE)$p.value
+    p <- ggplot(d, aes(x = grp, y = .data[[y]], fill = grp)) +
+      stat_summary(fun = mean, geom = "bar", color = "black", width = 0.6) +
+      stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2, size = 0.8) +
+      geom_jitter(shape = 21, size = 2.5, width = 0.15, stroke = 0.3,
+                  color = "black", alpha = 0.9) +
+      scale_fill_manual(values = group_colors) +
+      labs(x = NULL, y = "Serum ABCA1 Protein (ng/mL)",
+           title = paste0(score, " (High vs Low)")) +
+      theme_classic() +
+      theme(axis.title.y = element_text(size = 14, face = "bold"),
+            axis.text = element_text(size = 12, face = "bold"),
+            legend.position = "none",
+            axis.line = element_line(size = 0.8),
+            axis.ticks = element_line(size = 0.8),
+            plot.title = element_text(size = 16, face = "bold", hjust = 0.5)) +
+      annotate("text", x = 1.5, y = y_max * 1.05, label = p_to_label(pval),
+               size = 5, fontface = "bold")
+  } else {
+    # Wilcoxon p-value for annotation
+    pval <- wilcox.test(ABCA1_ng_ml ~ grp, data = d, exact = FALSE)$p.value
+    p <- ggplot(d, aes(x = grp, y = .data[[y]], fill = grp)) +
+      geom_boxplot(width = 0.55, color = "black", outlier.shape = NA, alpha = 0.9) +
+      geom_jitter(shape = 21, size = 2.5, width = 0.15, stroke = 0.3,
+                  color = "black", alpha = 0.9) +
+      scale_fill_manual(values = group_colors) +
+      labs(x = NULL, y = "Serum ABCA1 Protein (ng/mL)",
+           title = paste0(score, " (High vs Low)")) +
+      theme_classic() +
+      theme(axis.title.y = element_text(size = 14, face = "bold"),
+            axis.text = element_text(size = 12, face = "bold"),
+            legend.position = "none",
+            axis.line = element_line(size = 0.8),
+            axis.ticks = element_line(size = 0.8),
+            plot.title = element_text(size = 16, face = "bold", hjust = 0.5)) +
+      annotate("text", x = 1.5, y = y_max * 1.05, label = p_to_label(pval),
+               size = 5, fontface = "bold")
+  }
+  p
+}
+
+for (s in scores_to_use) {
+  p_g <- plot_grouped(dat, s, "ABCA1_ng_ml")
+  if (!is.null(p_g)) {
+    ggsave(filename = paste0("ABCA1_", s, "_HighLow.pdf"),
+           plot = p_g, width = 5, height = 5, device = "pdf")
+  }
+}
+
+# ---------------------------------------------------------
+# D) Optional: Early vs Non-early ROC (AUC)
+# ---------------------------------------------------------
+if ("ALSFRS_total" %in% scores_to_use) {
+  q3 <- quantile(dat$ALSFRS_total, 0.75, na.rm = TRUE)
+  dat$early <- factor(ifelse(dat$ALSFRS_total >= q3, "Early","NonEarly"))
+  if (nlevels(droplevels(dat$early)) == 2) {
+    roc1 <- roc(dat$early, dat$ABCA1_ng_ml, levels = c("NonEarly","Early"), direction = ">")
+    message(sprintf("AUC (ABCA1 for Early vs NonEarly): %.3f", as.numeric(roc1$auc)))
+    # If you want a ROC PDF: uncomment next two lines
+    # pdf("ABCA1_ROC_Early_vs_NonEarly.pdf", width = 5, height = 5)
+    # plot.roc(roc1, print.auc = TRUE); dev.off()
+  } else {
+    message("Skipping ROC: early/non-early collapsed to one class in this sample.")
+  }
+}
+
+readr::write_csv(cor_tab,   "ALSFRSR_ABCA1_spearman_results.csv")
+readr::write_csv(fit_list,  "ALSFRSR_ABCA1_adjusted_lm_results.csv")
+readr::write_csv(grp_results,"ALSFRSR_ABCA1_group_tests.csv")
+############################################################
+# METHODS (commented for manuscript)
+#
+# Study question.
+#   We examined whether serum ABCA1 levels relate to ALS functional status at
+#   assessment using the ALSFRS-R total score and its four domains
+#   (BULBAR, FINE MOTOR, GROSS MOTOR, RESPIRATORY).
+#
+# Data handling.
+#   Column names were harmonized by trimming leading/trailing spaces and
+#   standardizing key variables to snake_case (e.g., “Riluzole Use ” → Riluzole_Use).
+#   Sex was encoded as a binary factor (Female/Male). Medication use variables
+#   (e.g., lipid-lowering drugs, riluzole) were encoded as factors (No/Yes).
+#   ALSFRS-R scores and ABCA1 (ng/mL) were analyzed on their native scales.
+#
+# Primary association (correlation).
+#   Spearman rank correlations were computed between ABCA1 and each ALSFRS-R
+#   score (total and four domains). Two-sided p-values were reported and
+#   false-discovery rate (FDR) correction was applied across the five tests.
+#   For visualization, scatterplots with LOESS smoothing, marginal histograms,
+#   and in-panel annotations of Spearman’s rho and unadjusted p-values were used.
+#
+# Adjusted analyses (regression).
+#   For each ALSFRS-R score, a separate linear regression modeled ABCA1 as the
+#   outcome with the score as the main predictor, adjusting for available
+#   covariates (Age, Sex, BMI, eGFR, LDL, lipid-lowering drug use, riluzole use).
+#   Prior to modeling, covariates with only one observed level or value in the
+#   sample were removed a priori to avoid contrasts errors. To aid interpretation,
+#   standardized beta coefficients (and 95% CIs) for the ALSFRS-R score were
+#   obtained by refitting models with z-scored outcome and predictors.
+#   Nonlinearity of the ALSFRS-R total score was explored using a natural cubic
+#   spline (df = 3) specification (results descriptive).
+#
+# Grouped comparisons.
+#   Each ALSFRS-R score was dichotomized at the within-sample median (High vs Low).
+#   For ABCA1 differences between groups, normality within each group was assessed
+#   using the Shapiro–Wilk test and variance homogeneity was assessed using
+#   Levene’s test. If both groups were approximately normal (p ≥ 0.05) and
+#   variances were homogeneous (p ≥ 0.05), Student’s two-sample t-test
+#   (var.equal = TRUE) was used and results were visualized using bar charts
+#   of mean ± SE with jittered individual points. Otherwise, the Wilcoxon
+#   rank-sum test was applied and visualized using boxplots with jitter.
+#   Effect sizes (Cohen’s d for t-tests; rank-biserial for Wilcoxon) accompanied
+#   p-values; FDR correction across the five grouped comparisons was reported.
+#
+# Exploratory discrimination.
+#   “Early ALS” was defined a priori as the upper quartile of the ALSFRS-R total
+#   score. The ability of ABCA1 to distinguish Early vs Non-early was assessed
+#   using ROC analysis (AUC). This exploratory step is sample-size-limited and
+#   intended for hypothesis generation.
+#
+# Statistical environment.
+#   Analyses were performed in R using packages: readxl, dplyr, ggplot2, ggpubr,
+#   ggExtra, broom, rstatix, car, pROC, and splines. All tests were two-sided with
+#   α = 0.05. Figures were saved as PDF only.
+############################################################
