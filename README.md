@@ -214,4 +214,4 @@ ABCA1 acts as a protective modulator in amyotrophic lateral sclerosis
 
 # Contact
 
-For questions about the code or analysis, please contact 李强 at zzuliqiang@foxmail.com or open an issue in this repository.
+For questions about the code or analysis, please open an issue in this repository.
